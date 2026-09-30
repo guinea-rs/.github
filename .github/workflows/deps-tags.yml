@@ -1,0 +1,128 @@
+name: deps-tags
+
+on:
+  workflow_call:
+    inputs:
+      manifests:
+        type: string
+        default: '["Cargo.toml"]'
+      owners:
+        type: string
+        default: '["guinea-rs", "uniproc-dev"]'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  tags:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: compare pinned tags with the newest ones
+        shell: python
+        env:
+          MANIFESTS: ${{ inputs.manifests }}
+          OWNERS: ${{ inputs.owners }}
+          RUSTC_WRAPPER: ""
+        run: |
+          import collections, json, os, re, subprocess, tomllib
+
+          owners = {owner.lower() for owner in json.loads(os.environ["OWNERS"])}
+          semver = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+
+          def tables(manifest):
+              sections = ("dependencies", "dev-dependencies", "build-dependencies")
+              yield manifest.get("workspace", {}).get("dependencies", {})
+              for section in sections:
+                  yield manifest.get(section, {})
+              for target in manifest.get("target", {}).values():
+                  for section in sections:
+                      yield target.get(section, {})
+
+          def repo_of(url):
+              match = re.match(r"^(?:https://|ssh://git@|git@)github\.com[/:]([^/]+)/([^/]+?)(?:\.git)?/?$", url)
+              if match and match.group(1).lower() in owners:
+                  return f"{match.group(1)}/{match.group(2)}".lower()
+              return None
+
+          def members(workspace):
+              metadata = json.loads(subprocess.run(
+                  ["cargo", "metadata", "--format-version", "1", "--no-deps", "--manifest-path", workspace],
+                  check=True, capture_output=True, text=True,
+              ).stdout)
+              yield os.path.abspath(workspace)
+              for package in metadata["packages"]:
+                  yield os.path.abspath(package["manifest_path"])
+
+          manifests = dict.fromkeys(path for workspace in json.loads(os.environ["MANIFESTS"]) for path in members(workspace))
+
+          pins = collections.defaultdict(lambda: collections.defaultdict(set))
+          for path in manifests:
+              with open(path, "rb") as file:
+                  manifest = tomllib.load(file)
+              for table in tables(manifest):
+                  for name, spec in table.items():
+                      if isinstance(spec, dict) and "git" in spec and "tag" in spec:
+                          repo = repo_of(spec["git"])
+                          if repo:
+                              pins[repo][spec["tag"]].add(name)
+
+          rows = []
+          for repo, tags in sorted(pins.items()):
+              listed = subprocess.run(
+                  ["git", "ls-remote", "--tags", "--refs", f"https://github.com/{repo}"],
+                  capture_output=True, text=True,
+              )
+              if listed.returncode != 0:
+                  rows.append(f"| {repo} | {', '.join(sorted(tags))} | could not list tags | |")
+                  continue
+              versions = [
+                  (tuple(map(int, match.groups())), tag)
+                  for tag in (line.rsplit("refs/tags/", 1)[-1] for line in listed.stdout.splitlines())
+                  if (match := semver.match(tag))
+              ]
+              if not versions:
+                  continue
+              newest, newest_tag = max(versions)
+              for tag, crates in sorted(tags.items()):
+                  pinned = semver.match(tag)
+                  if not pinned:
+                      rows.append(f"| {repo} | {tag} | {newest_tag} | not a version tag |")
+                      continue
+                  current = tuple(map(int, pinned.groups()))
+                  if newest > current:
+                      step = "major" if newest[0] != current[0] or (newest[0] == 0 and newest[1] != current[1]) else "minor or patch"
+                      rows.append(f"| {repo} | {tag} | {newest_tag} | {step}: {', '.join(sorted(crates))} |")
+
+          with open("report.md", "w") as report:
+              if rows:
+                  report.write("Newer tags exist for git dependencies pinned in this repository.\n\n")
+                  report.write("| Repository | Pinned | Newest | Change |\n|---|---|---|---|\n")
+                  report.write("\n".join(rows) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"found={'true' if rows else 'false'}\n")
+        id: report
+
+      - name: keep one issue up to date
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FOUND: ${{ steps.report.outputs.found }}
+        run: |
+          label="dependency-tags"
+          title="Newer tags of our git dependencies"
+          open=$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')
+          if [ "$FOUND" = "true" ]; then
+            gh label create "$label" --color BFD4F2 --description "Newer tags of our own git dependencies" --force
+            if [ -n "$open" ]; then
+              gh issue edit "$open" --body-file report.md
+            else
+              gh issue create --title "$title" --label "$label" --body-file report.md
+            fi
+          elif [ -n "$open" ]; then
+            gh issue close "$open" --comment "Every pinned tag is the newest one."
+          fi

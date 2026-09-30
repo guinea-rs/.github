@@ -1,0 +1,66 @@
+name: deps-audit
+
+on:
+  workflow_call:
+    inputs:
+      manifests:
+        type: string
+        default: '["Cargo.toml"]'
+      own-crates:
+        type: string
+        default: '^(guinea|amethystate|ogurpchik|uniproc-protocol|uniproc-agent-kit|guicons|shown)([-_].+)?$'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_DENY_VERSION: 0.20.2
+  CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+  RUSTC_WRAPPER: ""
+
+jobs:
+  deny:
+    strategy:
+      fail-fast: false
+      matrix:
+        manifest: ${{ fromJSON(inputs.manifests) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: install cargo-deny
+        run: |
+          archive="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl --proto '=https' --tlsv1.2 -sSfL -o "$archive" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${archive}"
+          echo "${CARGO_DENY_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$archive" --strip-components=1 -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: cargo deny
+        run: cargo deny --manifest-path "${{ matrix.manifest }}" --all-features check
+
+      - name: one version of our crates
+        shell: python
+        env:
+          MANIFEST: ${{ matrix.manifest }}
+          OWN: ${{ inputs.own-crates }}
+        run: |
+          import collections, json, os, re, subprocess, sys
+
+          metadata = json.loads(subprocess.run(
+              ["cargo", "metadata", "--format-version", "1", "--all-features", "--manifest-path", os.environ["MANIFEST"]],
+              check=True, capture_output=True, text=True,
+          ).stdout)
+          own = re.compile(os.environ["OWN"])
+          copies = collections.defaultdict(set)
+          for package in metadata["packages"]:
+              if own.match(package["name"]):
+                  copies[package["name"]].add((package["version"], package.get("source") or "path"))
+          doubled = {name: sorted(found) for name, found in copies.items() if len(found) > 1}
+          for name, found in sorted(doubled.items()):
+              print(f"::error title=Two copies of {name}::" + "; ".join(f"{version} from {source}" for version, source in found))
+          sys.exit(1 if doubled else 0)
