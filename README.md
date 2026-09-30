@@ -19,7 +19,7 @@ Unpublished workspace crates (`publish = false`) are left out of the license che
 
 1. Copy `templates/deps.yml` to `.github/workflows/deps.yml` and replace `SHA` with the commit of this repository.
 2. Copy `templates/dependabot.yml` to `.github/dependabot.yml`.
-3. Copy `templates/deny.toml` to `deny.toml` next to each manifest.
+3. Copy `templates/deny.toml` to `deny.toml` at the repository root. cargo-deny runs from the root, so this one file governs every listed workspace; a copy next to another manifest is not read.
 4. List every workspace in `manifests`, as a JSON array, in both jobs.
 
 ## Where a repository may differ
